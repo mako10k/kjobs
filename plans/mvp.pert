@@ -5,16 +5,14 @@ project KJOBS:
   description "Deliver a simple local CLI for dependency-aware shell jobs, durable execution state, recovery, reusable templates, and perttool-backed priority selection. The initial velocity is provisional until completed work is observed."
   as_of 2026-08-02
   duration_unit point
-  velocity 3p/1d
+  velocity 7p/1d
   finish MVP_ACCEPTED
 
 
-milestone REQUIREMENTS_READY:
-  title "Requirements accepted"
-  state reached
 
 milestone DESIGN_READY:
   title "Basic design accepted"
+  state reached
 
 milestone FOUNDATION_READY:
   title "Project foundation ready"
@@ -39,14 +37,6 @@ resource DEVELOPMENT:
   capacity 1
 
 
-task BASIC_DESIGN REQUIREMENTS_READY -> DESIGN_READY:
-  title "Define architecture and contracts"
-  duration 4p
-  status done
-  priority 90
-  requires:
-    DEVELOPMENT 1
-  source "docs/basic-design.md"
 
 task PROJECT_FOUNDATION DESIGN_READY -> FOUNDATION_READY:
   title "Create TypeScript project foundation"
@@ -90,17 +80,3 @@ task MVP_ACCEPTANCE CLI_READY -> MVP_ACCEPTED:
   requires:
     DEVELOPMENT 1
 
-work_event WE-1d26e7e6fce6c7ccce776ef1231e76fd44c04dd7dd050f1df90b1f824cb1d7f2:
-  model 1
-  task BASIC_DESIGN
-  kind start
-  occurred_at 2026-08-02T09:48:16+09:00
-  planned_value 4p
-
-work_event WE-705d0cb27c2b375579fdd24e44996515fe7e333897512eceba5945b2ed696c65:
-  model 1
-  task BASIC_DESIGN
-  kind finish
-  occurred_at 2026-08-02T09:51:16+09:00
-  active_time 0.05h
-  effort 0.05ph
