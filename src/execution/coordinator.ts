@@ -20,6 +20,14 @@ export interface ExecuteJobOptions {
   readonly stdout?: Writable;
   readonly stderr?: Writable;
   readonly signal?: AbortSignal;
+  readonly startAuthority?: (context: StartAuthorityContext) => Promise<void>;
+}
+
+export interface StartAuthorityContext {
+  readonly loaded: LoadedDefinition;
+  readonly store: FileProjectStore;
+  readonly state: ProjectState;
+  readonly job: JobDefinition;
 }
 
 export interface JobExecutionResult {
@@ -49,13 +57,14 @@ export async function executeExplicitJob(options: ExecuteJobOptions): Promise<Jo
   const store = new FileProjectStore(stateDirectory);
   await store.initialize();
   const invocationId = createRunId();
-  const lease = await store.lock.acquire(invocationId);
+  const lease = await acquireProjectLock(store.lock, invocationId, 1_000);
   let run: Run;
   let handle;
   let completedWhileLocked: JobExecutionResult | null = null;
   try {
     let state = await recoverOrphanedRuns(store);
     await validateStart(store, state, job, definition.project.maxParallel, definition.resources);
+    await options.startAuthority?.(Object.freeze({ loaded: options.loaded, store, state, job }));
     const now = new Date().toISOString();
     const runId = createRunId();
     const ownerProcess = await inspectProcessIdentity(process.pid);
@@ -141,7 +150,7 @@ export async function executeExplicitJob(options: ExecuteJobOptions): Promise<Jo
 
   if (completedWhileLocked !== null) return completedWhileLocked;
   const completion: ShellCompletion = await handle.completion;
-  const finishLease = await store.lock.acquire(createRunId());
+  const finishLease = await acquireProjectLock(store.lock, createRunId(), 1_000);
   try {
     return await finalizeRun(store, job, run.runId, completion);
   } finally {
@@ -188,7 +197,7 @@ async function finalizeRun(
 export async function requestJobCancellation(loaded: LoadedDefinition, jobId: string): Promise<string> {
   const store = new FileProjectStore(resolve(dirname(loaded.file), loaded.definition.project.stateDir));
   await store.initialize();
-  const lease = await acquireCancelLock(store.lock, createRunId());
+  const lease = await acquireProjectLock(store.lock, createRunId(), 250);
   let identity;
   let runId: string;
   try {
@@ -210,8 +219,12 @@ export async function requestJobCancellation(loaded: LoadedDefinition, jobId: st
   return runId;
 }
 
-async function acquireCancelLock(lock: ProjectLock, invocationId: string): Promise<ProjectLockLease> {
-  const deadline = Date.now() + 250;
+async function acquireProjectLock(
+  lock: ProjectLock,
+  invocationId: string,
+  timeoutMs: number,
+): Promise<ProjectLockLease> {
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
       return await lock.acquire(invocationId);

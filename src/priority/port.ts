@@ -32,6 +32,13 @@ export interface PriorityResult {
   readonly blocked: readonly BlockedJob[];
   readonly reasons: ReadonlyMap<string, readonly PriorityReason[]>;
   readonly sourceDigest: string;
+  readonly diagnostics: readonly PriorityDiagnostic[];
+}
+
+export interface PriorityDiagnostic {
+  readonly code: string;
+  readonly severity: "error" | "warning" | "info";
+  readonly message: string;
 }
 
 export interface PriorityProvider {

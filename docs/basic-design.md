@@ -316,6 +316,7 @@ interface PriorityResult {
   blocked: readonly BlockedJob[];
   reasons: ReadonlyMap<string, readonly PriorityReason[]>;
   sourceDigest: string;
+  diagnostics: readonly PriorityDiagnostic[];
 }
 ```
 

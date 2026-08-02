@@ -25,10 +25,18 @@ Node.js 22 or later is required.
 npm install
 npm run check
 node dist/cli.js validate --file docs/examples/minimal.kjobs.yaml
+node dist/cli.js next --file docs/examples/minimal.kjobs.yaml
+node dist/cli.js run --file docs/examples/minimal.kjobs.yaml
 node dist/cli.js run hello --file docs/examples/minimal.kjobs.yaml
 ```
 
 The current implementation provides strict `kjobs.yaml` version 1 validation,
 durable explicit-ID shell execution, timeout and cancellation, local locking,
-and orphaned-run recovery. Automatic next-job selection remains unavailable
-until the perttool priority adapter is connected.
+orphaned-run recovery, and automatic next-job selection. `kjobs next` projects
+the current definition and persisted run states into an in-memory perttool
+Grammar 5 document and reports Ready, Recommended, Startable, and Blocked jobs.
+Running without a job ID executes only perttool's complete
+Startable-and-Recommended set; the authority is checked again under the project
+lock immediately before each process starts. An explicit job ID bypasses the
+recommendation but still enforces dependency, duplicate-run, parallel-slot, and
+resource-capacity checks.

@@ -71,3 +71,45 @@ jobs:
   assert.equal(json.ok, false);
   assert.deepEqual(json.data.terminal_reason, { kind: "exit", code: 9 });
 });
+
+test("next and ID-omitted run follow perttool start authority", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kjobs-cli-next-"));
+  await writeFile(join(directory, "kjobs.yaml"), `
+schema_version: 1
+project: { id: cli-next, max_parallel: 1 }
+jobs:
+  build: { command: "printf build", estimate: 2p, priority: 10 }
+  test: { command: "printf test", estimate: 3p, priority: 5, needs: [build] }
+`, "utf8");
+
+  const before = spawnSync(process.execPath, [cli.pathname, "next", "--format", "json"], { cwd: directory, encoding: "utf8" });
+  assert.equal(before.status, 0, before.stderr);
+  const beforeJson = JSON.parse(before.stdout);
+  assert.deepEqual(beforeJson.data.startable_recommended_job_ids, ["build"]);
+
+  const build = spawnSync(process.execPath, [cli.pathname, "run", "--format", "json"], { cwd: directory, encoding: "utf8" });
+  assert.equal(build.status, 0, build.stderr);
+  const buildJson = JSON.parse(build.stdout);
+  assert.deepEqual(buildJson.data.runs.map((run) => run.job_id), ["build"]);
+
+  const after = spawnSync(process.execPath, [cli.pathname, "next", "--format", "json"], { cwd: directory, encoding: "utf8" });
+  assert.equal(after.status, 0, after.stderr);
+  assert.deepEqual(JSON.parse(after.stdout).data.startable_recommended_job_ids, ["test"]);
+});
+
+test("ID-omitted run starts a jointly feasible recommendation set", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kjobs-cli-joint-"));
+  await writeFile(join(directory, "kjobs.yaml"), `
+schema_version: 1
+project: { id: cli-joint, max_parallel: 2 }
+jobs:
+  first: { command: "sleep 0.05", estimate: 1p }
+  second: { command: "sleep 0.05", estimate: 1p }
+`, "utf8");
+
+  const result = spawnSync(process.execPath, [cli.pathname, "run", "--format", "json"], { cwd: directory, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const json = JSON.parse(result.stdout);
+  assert.deepEqual(json.data.runs.map((run) => run.job_id).sort(), ["first", "second"]);
+  assert.ok(json.data.runs.every((run) => run.state === "succeeded"));
+});

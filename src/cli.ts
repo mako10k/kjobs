@@ -7,6 +7,11 @@ import {
   requestJobCancellation,
   type JobExecutionResult,
 } from "./execution/coordinator.js";
+import {
+  selectPrioritiesForState,
+  selectProjectPriorities,
+} from "./priority/project-priority.js";
+import type { PriorityResult } from "./priority/port.js";
 import { LockConflictError } from "./storage/file-lock.js";
 import { VERSION } from "./version.js";
 
@@ -28,6 +33,16 @@ interface RunData {
   readonly stderr_path: string;
 }
 
+interface PriorityData {
+  readonly complete: boolean;
+  readonly ready_job_ids: readonly string[];
+  readonly recommended_job_ids: readonly string[];
+  readonly startable_recommended_job_ids: readonly string[];
+  readonly blocked: readonly unknown[];
+  readonly reasons: Readonly<Record<string, unknown>>;
+  readonly source_digest: string;
+}
+
 async function main(argv: readonly string[]): Promise<number> {
   if (argv.length === 1 && (argv[0] === "--version" || argv[0] === "-V")) {
     process.stdout.write(`kjobs ${VERSION}\n`);
@@ -38,11 +53,12 @@ async function main(argv: readonly string[]): Promise<number> {
     return 0;
   }
   const command = argv[0];
-  if (command !== "validate" && command !== "run" && command !== "cancel") {
+  if (command !== "validate" && command !== "next" && command !== "run" && command !== "cancel") {
     process.stderr.write(`KJCLI001 error: unknown command ${command ?? ""}\n`);
     return 2;
   }
-  const parsed = parseArguments(argv.slice(1), command !== "validate");
+  const operand = command === "cancel" ? "required" : command === "run" ? "optional" : "none";
+  const parsed = parseArguments(argv.slice(1), operand);
   if (!parsed.ok) {
     process.stderr.write(`KJCLI002 error: ${parsed.message}\n`);
     return 2;
@@ -50,10 +66,12 @@ async function main(argv: readonly string[]): Promise<number> {
   const loaded = await discoverAndLoad(parsed.file, parsed.format, command);
   if (typeof loaded === "number") return loaded;
   if (command === "validate") return renderValidation(loaded, parsed.format);
+  if (command === "next") return nextJobs(loaded, parsed.format);
   const jobId = parsed.jobId;
+  if (command === "run") return runJob(loaded, jobId, parsed.format);
   if (jobId === null) return 2;
   if (command === "cancel") return cancelJob(loaded, jobId, parsed.format);
-  return runJob(loaded, jobId, parsed.format);
+  return 2;
 }
 
 async function discoverAndLoad(
@@ -96,43 +114,120 @@ function renderValidation(loaded: LoadedDefinition, format: OutputFormat): numbe
   return 0;
 }
 
-async function runJob(loaded: LoadedDefinition, jobId: string, format: OutputFormat): Promise<number> {
+async function nextJobs(loaded: LoadedDefinition, format: OutputFormat): Promise<number> {
+  try {
+    const priority = await selectProjectPriorities(loaded);
+    const data = priorityData(priority);
+    const diagnostics = priorityDiagnostics(priority);
+    const result = envelope("next", priority.complete, loaded.definition.project.id, loaded.digest, data, diagnostics);
+    if (format === "json") process.stdout.write(`${JSON.stringify(result)}\n`);
+    else {
+      process.stdout.write(`READY ${displayIds(priority.readyJobIds)}\n`);
+      process.stdout.write(`RECOMMENDED ${displayIds(priority.recommendedJobIds)}\n`);
+      process.stdout.write(`STARTABLE ${displayIds(priority.startableRecommendedJobIds)}\n`);
+      for (const blocked of priority.blocked) process.stdout.write(`BLOCKED ${blocked.jobId} reason=${blocked.reasons[0]?.code ?? "unknown"}\n`);
+    }
+    return priority.complete ? 0 : 1;
+  } catch (error) {
+    return renderExecutionError(format, "next", error);
+  }
+}
+
+async function runJob(loaded: LoadedDefinition, jobId: string | null, format: OutputFormat): Promise<number> {
   const controller = new AbortController();
   const interrupt = (): void => controller.abort();
   process.once("SIGINT", interrupt);
   try {
-    const execution = await executeExplicitJob({
+    const initialPriority = jobId === null ? await selectProjectPriorities(loaded) : null;
+    if (initialPriority !== null && !initialPriority.complete) {
+      return renderFailure(format, "run", priorityDiagnostics(initialPriority));
+    }
+    const selectedIds = jobId === null ? initialPriority!.startableRecommendedJobIds : [jobId];
+    if (selectedIds.length === 0) {
+      return renderFailure(format, "run", [{ code: "KJPRI003", severity: "error", message: "no startable recommended job is available" }]);
+    }
+    const executions = await Promise.allSettled(selectedIds.map((selectedId) => executeExplicitJob({
       loaded,
-      jobId,
+      jobId: selectedId,
       stdout: format === "json" ? process.stderr : process.stdout,
       stderr: process.stderr,
       signal: controller.signal,
-    });
-    const data: RunData = {
-      run_id: execution.runId,
-      job_id: execution.jobId,
-      state: execution.state,
-      terminal_reason: execution.terminalReason,
-      stdout_path: execution.stdoutPath,
-      stderr_path: execution.stderrPath,
-    };
-    const ok = execution.state === "succeeded";
-    const diagnostics: readonly Diagnostic[] = ok ? [] : [{
+      ...(jobId !== null ? {} : {
+        startAuthority: async (context): Promise<void> => {
+          const current = await selectPrioritiesForState(context.loaded, context.store, context.state);
+          if (!current.complete || !current.startableRecommendedJobIds.includes(context.job.id)) {
+            throw new ExecutionPreflightError({
+              code: "KJPRI004",
+              severity: "error",
+              message: `start authority changed before ${context.job.id} could start`,
+              path: `jobs.${context.job.id}`,
+            });
+          }
+        },
+      }),
+    })));
+    const rejected = executions.find((execution): execution is PromiseRejectedResult => execution.status === "rejected");
+    if (rejected !== undefined) throw rejected.reason;
+    const completed = executions.map((execution) => (execution as PromiseFulfilledResult<JobExecutionResult>).value);
+    const runs = completed.map(runData);
+    const ok = completed.every((execution) => execution.state === "succeeded");
+    const diagnostics: Diagnostic[] = completed.flatMap((execution) => execution.state === "succeeded" ? [] : [{
       code: execution.terminalReason.kind === "timeout" ? "KJRUN011" : "KJRUN010",
-      severity: "error",
-      message: `job ${jobId} ended in state ${execution.state}`,
-      path: `jobs.${jobId}`,
-    }];
+      severity: "error" as const,
+      message: `job ${execution.jobId} ended in state ${execution.state}`,
+      path: `jobs.${execution.jobId}`,
+    }]);
+    const data = jobId === null
+      ? { selection_digest: initialPriority!.sourceDigest, runs }
+      : runs[0]!;
     const result = envelope("run", ok, loaded.definition.project.id, loaded.digest, data, diagnostics);
     if (format === "json") process.stdout.write(`${JSON.stringify(result)}\n`);
-    else process.stdout.write(`\nRUN ${execution.runId} job=${jobId} state=${execution.state} reason=${execution.terminalReason.kind}\n`);
-    if (execution.terminalReason.kind === "timeout" || execution.terminalReason.kind === "canceled") return 5;
+    else for (const execution of completed) process.stdout.write(`\nRUN ${execution.runId} job=${execution.jobId} state=${execution.state} reason=${execution.terminalReason.kind}\n`);
+    if (completed.some((execution) => execution.terminalReason.kind === "timeout" || execution.terminalReason.kind === "canceled")) return 5;
     return ok ? 0 : 1;
   } catch (error) {
     return renderExecutionError(format, "run", error);
   } finally {
     process.removeListener("SIGINT", interrupt);
   }
+}
+
+function runData(execution: JobExecutionResult): RunData {
+  return {
+    run_id: execution.runId,
+    job_id: execution.jobId,
+    state: execution.state,
+    terminal_reason: execution.terminalReason,
+    stdout_path: execution.stdoutPath,
+    stderr_path: execution.stderrPath,
+  };
+}
+
+function priorityData(priority: PriorityResult): PriorityData {
+  return {
+    complete: priority.complete,
+    ready_job_ids: priority.readyJobIds,
+    recommended_job_ids: priority.recommendedJobIds,
+    startable_recommended_job_ids: priority.startableRecommendedJobIds,
+    blocked: priority.blocked.map((blocked) => ({
+      job_id: blocked.jobId,
+      reasons: blocked.reasons,
+    })),
+    reasons: Object.fromEntries(priority.reasons),
+    source_digest: priority.sourceDigest,
+  };
+}
+
+function priorityDiagnostics(priority: PriorityResult): readonly Diagnostic[] {
+  return priority.diagnostics.map((diagnostic) => ({
+    code: diagnostic.code,
+    severity: diagnostic.severity === "error" ? "error" : "warning",
+    message: diagnostic.message,
+  }));
+}
+
+function displayIds(ids: readonly string[]): string {
+  return ids.length === 0 ? "-" : ids.join(",");
 }
 
 async function cancelJob(loaded: LoadedDefinition, jobId: string, format: OutputFormat): Promise<number> {
@@ -157,7 +252,7 @@ function renderExecutionError(format: OutputFormat, operation: string, error: un
   return renderFailure(format, operation, [{ code: "KJCLI070", severity: "error", message: "internal failure" }], 70);
 }
 
-function parseArguments(argv: readonly string[], requireJobId: boolean):
+function parseArguments(argv: readonly string[], jobOperand: "none" | "optional" | "required"):
   | { readonly ok: true; readonly jobId: string | null; readonly file: string | null; readonly format: OutputFormat }
   | { readonly ok: false; readonly message: string } {
   let jobId: string | null = null;
@@ -175,13 +270,13 @@ function parseArguments(argv: readonly string[], requireJobId: boolean):
       if (value !== "text" && value !== "json") return { ok: false, message: "--format must be text or json" };
       format = value;
       index += 1;
-    } else if (!argument?.startsWith("-") && jobId === null && requireJobId) {
+    } else if (!argument?.startsWith("-") && jobId === null && jobOperand !== "none") {
       jobId = argument ?? null;
     } else {
       return { ok: false, message: `unknown option or operand ${argument ?? ""}` };
     }
   }
-  if (requireJobId && jobId === null) return { ok: false, message: "job ID is required" };
+  if (jobOperand === "required" && jobId === null) return { ok: false, message: "job ID is required" };
   return { ok: true, jobId, file, format };
 }
 
@@ -223,7 +318,8 @@ function helpText(): string {
     "",
     "Usage:",
     "  kjobs validate [--file <path>] [--format text|json]",
-    "  kjobs run <job-id> [--file <path>] [--format text|json]",
+    "  kjobs next [--file <path>] [--format text|json]",
+    "  kjobs run [<job-id>] [--file <path>] [--format text|json]",
     "  kjobs cancel <job-id> [--file <path>] [--format text|json]",
     "  kjobs --version",
     "",

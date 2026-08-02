@@ -27,6 +27,7 @@ export type {
 export type {
   BlockedJob,
   PriorityInput,
+  PriorityDiagnostic,
   PriorityJob,
   PriorityProvider,
   PriorityReason,
@@ -50,7 +51,7 @@ export {
   recoverOrphanedRuns,
   requestJobCancellation,
 } from "./execution/coordinator.js";
-export type { ExecuteJobOptions, JobExecutionResult } from "./execution/coordinator.js";
+export type { ExecuteJobOptions, JobExecutionResult, StartAuthorityContext } from "./execution/coordinator.js";
 export { signalProcessGroup, startShell } from "./execution/shell-runner.js";
 export type { ShellCompletion, ShellHandle, ShellStartRequest } from "./execution/shell-runner.js";
 export { atomicWriteJson, ensurePrivateDirectory } from "./storage/atomic-file.js";
@@ -62,3 +63,9 @@ export {
 } from "./storage/file-project-store.js";
 export type { ProjectEvent, RunPaths } from "./storage/file-project-store.js";
 export { inspectProcessIdentity, processIdentityMatches } from "./storage/process-identity.js";
+export { PerttoolPriorityProvider, projectPriorityDocument } from "./priority/perttool-provider.js";
+export {
+  projectStore,
+  selectPrioritiesForState,
+  selectProjectPriorities,
+} from "./priority/project-priority.js";
