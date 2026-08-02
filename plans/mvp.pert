@@ -42,9 +42,11 @@ resource DEVELOPMENT:
 task BASIC_DESIGN REQUIREMENTS_READY -> DESIGN_READY:
   title "Define architecture and contracts"
   duration 4p
+  status done
   priority 90
   requires:
     DEVELOPMENT 1
+  source "docs/basic-design.md"
 
 task PROJECT_FOUNDATION DESIGN_READY -> FOUNDATION_READY:
   title "Create TypeScript project foundation"
@@ -88,3 +90,17 @@ task MVP_ACCEPTANCE CLI_READY -> MVP_ACCEPTED:
   requires:
     DEVELOPMENT 1
 
+work_event WE-1d26e7e6fce6c7ccce776ef1231e76fd44c04dd7dd050f1df90b1f824cb1d7f2:
+  model 1
+  task BASIC_DESIGN
+  kind start
+  occurred_at 2026-08-02T09:48:16+09:00
+  planned_value 4p
+
+work_event WE-705d0cb27c2b375579fdd24e44996515fe7e333897512eceba5945b2ed696c65:
+  model 1
+  task BASIC_DESIGN
+  kind finish
+  occurred_at 2026-08-02T09:51:16+09:00
+  active_time 0.05h
+  effort 0.05ph

@@ -4,9 +4,10 @@
 shell execution, recovery, reusable templates, and `perttool`-backed priority
 selection.
 
-The project is currently in requirements and design. See:
+The MVP requirements and basic design are tracked with `perttool`. See:
 
 - [MVP requirements](docs/requirements.md)
+- [MVP basic design](docs/basic-design.md)
 - [MVP progress plan](plans/mvp.pert)
 
 Validate and inspect the current plan with `perttool 0.5.0`:
