@@ -5,19 +5,17 @@ project KJOBS:
   description "Deliver a simple local CLI for dependency-aware shell jobs, durable execution state, recovery, reusable templates, and perttool-backed priority selection. The initial velocity is provisional until completed work is observed."
   as_of 2026-08-02
   duration_unit point
-  velocity 20p/1d
+  velocity 25p/1d
   finish MVP_ACCEPTED
 
 
 
 
 
-milestone EXECUTION_READY:
-  title "Execution engine ready"
-  state reached
 
 milestone PRIORITY_READY:
   title "Priority integration ready"
+  state reached
 
 milestone RESILIENCE_READY:
   title "Recovery and templates ready"
@@ -36,14 +34,6 @@ resource DEVELOPMENT:
 
 
 
-task PERTTOOL_INTEGRATION EXECUTION_READY -> PRIORITY_READY:
-  title "Integrate perttool priority provider"
-  duration 5p
-  status done
-  priority 60
-  requires:
-    DEVELOPMENT 1
-  source "src/priority/perttool-provider.ts"
 
 task RECOVERY_TEMPLATES PRIORITY_READY -> RESILIENCE_READY:
   title "Implement retry recovery and templates"
@@ -66,17 +56,3 @@ task MVP_ACCEPTANCE CLI_READY -> MVP_ACCEPTED:
   requires:
     DEVELOPMENT 1
 
-work_event WE-44f83226a86cf45ee611ebf594f5c625312f8e9d4cd55b91b7dd8f7af4fc9c74:
-  model 1
-  task PERTTOOL_INTEGRATION
-  kind start
-  occurred_at 2026-08-02T11:31:22+09:00
-  planned_value 5p
-
-work_event WE-d732c4625c463edffb6318516a582389bba59a9465b18dbe16d29230c47890bd:
-  model 1
-  task PERTTOOL_INTEGRATION
-  kind finish
-  occurred_at 2026-08-02T11:39:22+09:00
-  active_time 2/15h
-  effort 2/15ph
