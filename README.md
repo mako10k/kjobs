@@ -25,8 +25,10 @@ Node.js 22 or later is required.
 npm install
 npm run check
 node dist/cli.js validate --file docs/examples/minimal.kjobs.yaml
+node dist/cli.js run hello --file docs/examples/minimal.kjobs.yaml
 ```
 
-The current foundation provides strict `kjobs.yaml` version 1 validation and
-the shared domain and adapter contracts. Shell execution is tracked as the
-next implementation slice and is not available yet.
+The current implementation provides strict `kjobs.yaml` version 1 validation,
+durable explicit-ID shell execution, timeout and cancellation, local locking,
+and orphaned-run recovery. Automatic next-job selection remains unavailable
+until the perttool priority adapter is connected.

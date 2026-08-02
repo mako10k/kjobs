@@ -38,3 +38,36 @@ test("validate fails closed for an invalid definition", async () => {
   assert.equal(json.ok, false);
   assert.ok(json.diagnostics.some((diagnostic) => diagnostic.code === "KJCFG031"));
 });
+
+test("run executes an explicit job and returns one JSON result", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kjobs-cli-run-"));
+  await writeFile(join(directory, "kjobs.yaml"), `
+schema_version: 1
+project: { id: cli-run }
+jobs:
+  hello: { command: "printf hello", estimate: 1p }
+`, "utf8");
+  const result = spawnSync(process.execPath, [cli.pathname, "run", "hello", "--format", "json"], { cwd: directory, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const json = JSON.parse(result.stdout);
+  assert.equal(json.ok, true);
+  assert.equal(json.operation, "run");
+  assert.equal(json.data.job_id, "hello");
+  assert.equal(json.data.state, "succeeded");
+  assert.equal(await import("node:fs/promises").then(({ readFile }) => readFile(json.data.stdout_path, "utf8")), "hello");
+});
+
+test("run preserves a failed shell exit in structured output", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kjobs-cli-fail-"));
+  await writeFile(join(directory, "kjobs.yaml"), `
+schema_version: 1
+project: { id: cli-fail }
+jobs:
+  fail: { command: "exit 9", estimate: 1p }
+`, "utf8");
+  const result = spawnSync(process.execPath, [cli.pathname, "run", "fail", "--format", "json"], { cwd: directory, encoding: "utf8" });
+  assert.equal(result.status, 1);
+  const json = JSON.parse(result.stdout);
+  assert.equal(json.ok, false);
+  assert.deepEqual(json.data.terminal_reason, { kind: "exit", code: 9 });
+});

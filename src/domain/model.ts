@@ -33,7 +33,13 @@ export interface AttemptSummary {
   readonly attempt: number;
   readonly startedAt: string;
   readonly finishedAt: string | null;
+  readonly process: ProcessIdentity | null;
   readonly terminalReason: TerminalReason | null;
+}
+
+export interface ProcessIdentity {
+  readonly pid: number;
+  readonly startMarker: string;
 }
 
 export interface Run {
@@ -45,5 +51,8 @@ export interface Run {
   readonly attempts: readonly AttemptSummary[];
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly ownerProcess: ProcessIdentity;
+  readonly process: ProcessIdentity | null;
+  readonly cancelRequestedAt?: string;
   readonly terminalReason?: TerminalReason;
 }

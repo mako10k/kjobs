@@ -18,7 +18,7 @@ export interface StateRepository {
 }
 
 export interface RunRepository {
-  create(run: Run): Promise<void>;
+  create(run: Run, definitionSnapshot: unknown): Promise<void>;
   load(runId: string): Promise<Run | null>;
   save(run: Run): Promise<void>;
   list(jobId?: string): AsyncIterable<Run>;
