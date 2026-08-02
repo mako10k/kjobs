@@ -14,6 +14,11 @@ export interface RunPaths {
   readonly attempts: string;
 }
 
+export interface ProcessLogPaths {
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
 export interface ProjectEvent {
   readonly schema_version: 1;
   readonly event_id: string;
@@ -137,6 +142,16 @@ export class FileProjectStore {
       stdout: join(directory, "stdout.log"),
       stderr: join(directory, "stderr.log"),
       attempts: join(directory, "attempts"),
+    });
+  }
+
+  async prepareAttemptPaths(runId: string, attempt: number, recovery = false): Promise<ProcessLogPaths> {
+    const directory = join(this.pathsFor(runId).attempts, String(attempt));
+    await ensurePrivateDirectory(directory);
+    const prefix = recovery ? "recovery-" : "";
+    return Object.freeze({
+      stdout: join(directory, `${prefix}stdout.log`),
+      stderr: join(directory, `${prefix}stderr.log`),
     });
   }
 }

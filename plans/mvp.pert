@@ -38,9 +38,11 @@ resource DEVELOPMENT:
 task RECOVERY_TEMPLATES PRIORITY_READY -> RESILIENCE_READY:
   title "Implement retry recovery and templates"
   duration 8p
+  status done
   priority 50
   requires:
     DEVELOPMENT 1
+  source "src/execution/coordinator.ts"
 
 task CLI_OBSERVABILITY RESILIENCE_READY -> CLI_READY:
   title "Complete CLI status history and JSON output"
@@ -56,3 +58,17 @@ task MVP_ACCEPTANCE CLI_READY -> MVP_ACCEPTED:
   requires:
     DEVELOPMENT 1
 
+work_event WE-c48ef8f825d9882d4a016369291c083f3efa75f080b8a701911ac5f17d3c45f2:
+  model 1
+  task RECOVERY_TEMPLATES
+  kind start
+  occurred_at 2026-08-02T15:15:55+09:00
+  planned_value 8p
+
+work_event WE-c4365ea036911e951abc150c366b141d79603babfb04cfa93d9543c3141d41af:
+  model 1
+  task RECOVERY_TEMPLATES
+  kind finish
+  occurred_at 2026-08-02T15:28:55+09:00
+  active_time 13/60h
+  effort 13/60ph

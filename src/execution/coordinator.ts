@@ -4,7 +4,7 @@ import type { Writable } from "node:stream";
 import type { LoadedDefinition } from "../config/file.js";
 import type { JobDefinition } from "../config/types.js";
 import type { Diagnostic } from "../domain/result.js";
-import type { AttemptSummary, Run, RunState, TerminalReason } from "../domain/model.js";
+import type { AttemptSummary, RecoveryAttemptSummary, Run, RunState, TerminalReason } from "../domain/model.js";
 import { createRunId } from "../domain/run-id.js";
 import { isTerminalRunState } from "../domain/run-state.js";
 import { FileProjectStore, emptyProjectState, type ProjectEvent } from "../storage/file-project-store.js";
@@ -12,7 +12,7 @@ import { LockConflictError } from "../storage/file-lock.js";
 import type { ProjectLock, ProjectLockLease, ProjectState } from "../storage/ports.js";
 import { inspectProcessIdentity, processIdentityMatches } from "../storage/process-identity.js";
 import { buildJobEnvironment } from "./environment.js";
-import { signalProcessGroup, startShell, type ShellCompletion } from "./shell-runner.js";
+import { signalProcessGroup, startShell, type ShellCompletion, type ShellHandle } from "./shell-runner.js";
 
 export interface ExecuteJobOptions {
   readonly loaded: LoadedDefinition;
@@ -50,8 +50,6 @@ export async function executeExplicitJob(options: ExecuteJobOptions): Promise<Jo
   const definition = options.loaded.definition;
   const job = definition.jobs.get(options.jobId);
   if (job === undefined) throw preflight("KJRUN001", `unknown job ${options.jobId}`, `jobs.${options.jobId}`);
-  if (job.command === undefined) throw preflight("KJRUN002", "template jobs are unavailable until template expansion is implemented", `jobs.${job.id}`);
-
   const projectRoot = dirname(options.loaded.file);
   const stateDirectory = resolve(projectRoot, definition.project.stateDir);
   const store = new FileProjectStore(stateDirectory);
@@ -59,8 +57,7 @@ export async function executeExplicitJob(options: ExecuteJobOptions): Promise<Jo
   const invocationId = createRunId();
   const lease = await acquireProjectLock(store.lock, invocationId, 1_000);
   let run: Run;
-  let handle;
-  let completedWhileLocked: JobExecutionResult | null = null;
+  let lifecycleProcess!: StartedProcess;
   try {
     let state = await recoverOrphanedRuns(store);
     await validateStart(store, state, job, definition.project.maxParallel, definition.resources);
@@ -94,126 +91,353 @@ export async function executeExplicitJob(options: ExecuteJobOptions): Promise<Jo
     });
     await store.saveState(state, expectedRevision === 0 && await stateFileWasAbsent(store) ? null : expectedRevision);
 
-    const paths = store.pathsFor(runId);
-    let environment: Readonly<Record<string, string>>;
-    try {
-      environment = buildJobEnvironment(job);
-    } catch (error) {
-      run = await failCreatedRun(store, state, run, {
-        kind: "spawn_error",
-        ...(error instanceof Error ? { code: error.name } : {}),
-      });
-      return resultFromRun(run, paths.stdout, paths.stderr);
-    }
-    try {
-      handle = await startShell({
-        shell: job.shell,
-        command: job.command,
-        cwd: resolve(projectRoot, job.cwd),
-        env: environment,
-        stdoutPath: paths.stdout,
-        stderrPath: paths.stderr,
-        ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
-        ...(options.stdout === undefined ? {} : { stdoutTee: options.stdout }),
-        ...(options.stderr === undefined ? {} : { stderrTee: options.stderr }),
-        ...(options.signal === undefined ? {} : { signal: options.signal }),
-      });
-    } catch (error) {
-      run = await failCreatedRun(store, state, run, {
-        kind: "spawn_error",
-        ...(errorCode(error) === undefined ? {} : { code: errorCode(error)! }),
-      });
-      return resultFromRun(run, paths.stdout, paths.stderr);
-    }
-    const attempt: AttemptSummary = Object.freeze({
-      attempt: 1,
-      startedAt: handle.startedAt,
-      finishedAt: null,
-      process: handle.identity,
-      terminalReason: null,
-    });
-    run = Object.freeze({
-      ...run,
-      state: "running" as const,
-      attempts: Object.freeze([attempt]),
-      updatedAt: handle.startedAt,
-      process: handle.identity,
-    });
-    await store.saveRun(run);
-    await store.appendEvent(event(run, "run.started", handle.startedAt, { pid: handle.identity.pid }));
-    if (handle.identity.startMarker.startsWith("exited:")) {
-      completedWhileLocked = await finalizeRun(store, job, run.runId, await handle.completion);
-    }
+    ({ run, process: lifecycleProcess } = await startMainAttempt(store, run, job, projectRoot, options));
   } finally {
     await lease.release();
   }
 
-  if (completedWhileLocked !== null) return completedWhileLocked;
-  const completion: ShellCompletion = await handle.completion;
-  const finishLease = await acquireProjectLock(store.lock, createRunId(), 1_000);
-  try {
-    return await finalizeRun(store, job, run.runId, completion);
-  } finally {
-    await finishLease.release();
+  for (;;) {
+    const completion = await lifecycleProcess.completion;
+    const finishLease = await acquireProjectLock(store.lock, createRunId(), 1_000);
+    let decision: LifecycleDecision;
+    try {
+      decision = lifecycleProcess.kind === "main"
+        ? await settleMainAttempt(store, job, run.runId, completion, projectRoot, options)
+        : await settleRecoveryAttempt(store, job, run.runId, completion);
+    } finally {
+      await finishLease.release();
+    }
+    if (decision.kind === "done") return resultFromRun(decision.run);
+    if (decision.kind === "process") {
+      lifecycleProcess = decision.process;
+      continue;
+    }
+    await waitForRetry(decision.delayMs, options.signal);
+    for (;;) {
+      const retryLease = await acquireProjectLock(store.lock, createRunId(), 1_000);
+      let retry: StartedProcess | JobExecutionResult | null = null;
+      try {
+        const current = await store.loadRun(run.runId);
+        if (current === null) throw new Error(`run ${run.runId} disappeared`);
+        if (isTerminalRunState(current.state)) retry = resultFromRun(current);
+        else if (current.cancelRequestedAt !== undefined || options.signal?.aborted === true) {
+          retry = resultFromRun(await finishRun(store, current, "canceled", { kind: "canceled" }));
+        } else {
+          const state = await recoverOrphanedRuns(store);
+          try {
+            await validateStart(store, state, job, definition.project.maxParallel, definition.resources, current.runId);
+            const reserved = await addActiveRun(store, state, current.runId);
+            ({ process: retry } = await startMainAttempt(store, reserved, job, projectRoot, options));
+          } catch (error) {
+            if (!(error instanceof ExecutionPreflightError)
+              || (error.diagnostic.code !== "KJRUN003" && error.diagnostic.code !== "KJRUN007")) throw error;
+          }
+        }
+      } finally {
+        await retryLease.release();
+      }
+      if (retry !== null) {
+        if ("runId" in retry) return retry;
+        lifecycleProcess = retry;
+        break;
+      }
+      await waitForRetry(25, options.signal);
+    }
   }
 }
 
-async function finalizeRun(
+interface StartedProcess {
+  readonly kind: "main" | "recovery";
+  readonly completion: Promise<ShellCompletion>;
+}
+
+type LifecycleDecision =
+  | { readonly kind: "done"; readonly run: Run }
+  | { readonly kind: "process"; readonly process: StartedProcess }
+  | { readonly kind: "retry"; readonly delayMs: number };
+
+async function startMainAttempt(
+  store: FileProjectStore,
+  run: Run,
+  job: JobDefinition,
+  projectRoot: string,
+  options: ExecuteJobOptions,
+): Promise<{ readonly run: Run; readonly process: StartedProcess }> {
+  const attemptNumber = run.attempts.length + 1;
+  const logs = await store.prepareAttemptPaths(run.runId, attemptNumber);
+  const started = await startConfiguredShell(job, job.command, job.timeoutMs, projectRoot, logs, options);
+  const attempt: AttemptSummary = Object.freeze({
+    attempt: attemptNumber,
+    startedAt: started.startedAt,
+    finishedAt: null,
+    process: started.identity,
+    terminalReason: null,
+    stdoutPath: logs.stdout,
+    stderrPath: logs.stderr,
+  });
+  const { retryReadyAt: _retryReadyAt, terminalReason: _terminalReason, ...runWithoutTerminal } = run;
+  const next = Object.freeze({
+    ...runWithoutTerminal,
+    state: "running" as const,
+    attempts: Object.freeze([...run.attempts, attempt]),
+    updatedAt: started.startedAt,
+    process: started.identity,
+  });
+  await store.saveRun(next);
+  await store.appendEvent(event(next, "run.attempt_started", started.startedAt, { attempt: attemptNumber, ...(started.identity === null ? {} : { pid: started.identity.pid }) }));
+  return Object.freeze({ run: next, process: Object.freeze({ kind: "main" as const, completion: started.completion }) });
+}
+
+async function settleMainAttempt(
   store: FileProjectStore,
   job: JobDefinition,
   runId: string,
   completion: ShellCompletion,
-): Promise<JobExecutionResult> {
-  const current = await store.loadRun(runId);
-  if (current === null) throw new Error(`run ${runId} disappeared`);
-  const canceled = current.cancelRequestedAt !== undefined || completion.reason.kind === "canceled";
-  const succeeded = completion.reason.kind === "exit" && job.successExitCodes.includes(completion.reason.code);
-  const state: RunState = canceled ? "canceled" : succeeded ? "succeeded" : "failed";
-  const reason: TerminalReason = canceled ? { kind: "canceled" } : completion.reason;
-  const attempt = current.attempts[0];
-  if (attempt === undefined) throw new Error("running run has no attempt");
-  const run = Object.freeze({
-    ...current,
+  projectRoot: string,
+  options: ExecuteJobOptions,
+): Promise<LifecycleDecision> {
+  const current = await requiredRun(store, runId);
+  if (isTerminalRunState(current.state)) return { kind: "done", run: current };
+  const last = current.attempts.at(-1);
+  if (last === undefined) throw new Error("running run has no attempt");
+  const attempts = Object.freeze([...current.attempts.slice(0, -1), Object.freeze({
+    ...last,
+    finishedAt: completion.finishedAt,
+    process: null,
+    terminalReason: completion.reason,
+  })]);
+  const settled = Object.freeze({ ...current, attempts, updatedAt: completion.finishedAt, process: null });
+  await store.saveRun(settled);
+  await store.appendEvent(event(settled, "run.attempt_finished", completion.finishedAt, { attempt: last.attempt, ...terminalDetails(completion.reason) }));
+  if (current.cancelRequestedAt !== undefined || completion.reason.kind === "canceled") {
+    return { kind: "done", run: await finishRun(store, settled, "canceled", { kind: "canceled" }) };
+  }
+  if (completion.reason.kind === "exit" && job.successExitCodes.includes(completion.reason.code)) {
+    return { kind: "done", run: await finishRun(store, settled, "succeeded", completion.reason) };
+  }
+  if (job.recovery !== undefined) {
+    const logs = await store.prepareAttemptPaths(runId, last.attempt, true);
+    const started = await startConfiguredShell(job, job.recovery.command, job.recovery.timeoutMs, projectRoot, logs, options);
+    const recovery: RecoveryAttemptSummary = Object.freeze({
+      startedAt: started.startedAt,
+      finishedAt: null,
+      process: started.identity,
+      terminalReason: null,
+      stdoutPath: logs.stdout,
+      stderrPath: logs.stderr,
+    });
+    const recoveryRun = Object.freeze({
+      ...settled,
+      state: "recovering" as const,
+      attempts: Object.freeze([...attempts.slice(0, -1), Object.freeze({ ...attempts.at(-1)!, recovery })]),
+      updatedAt: started.startedAt,
+      process: started.identity,
+    });
+    await store.saveRun(recoveryRun);
+    await store.appendEvent(event(recoveryRun, "run.recovery_started", started.startedAt, { attempt: last.attempt }));
+    return { kind: "process", process: Object.freeze({ kind: "recovery", completion: started.completion }) };
+  }
+  return scheduleRetryOrFinish(store, job, settled, completion.reason);
+}
+
+async function settleRecoveryAttempt(
+  store: FileProjectStore,
+  job: JobDefinition,
+  runId: string,
+  completion: ShellCompletion,
+): Promise<LifecycleDecision> {
+  const current = await requiredRun(store, runId);
+  if (isTerminalRunState(current.state)) return { kind: "done", run: current };
+  const last = current.attempts.at(-1);
+  if (last?.recovery === undefined) throw new Error("recovering run has no recovery attempt");
+  const recovery = Object.freeze({
+    ...last.recovery,
+    finishedAt: completion.finishedAt,
+    process: null,
+    terminalReason: completion.reason,
+  });
+  const attempts = Object.freeze([...current.attempts.slice(0, -1), Object.freeze({ ...last, recovery })]);
+  const settled = Object.freeze({ ...current, attempts, updatedAt: completion.finishedAt, process: null });
+  await store.saveRun(settled);
+  await store.appendEvent(event(settled, "run.recovery_finished", completion.finishedAt, { attempt: last.attempt, ...terminalDetails(completion.reason) }));
+  if (current.cancelRequestedAt !== undefined || completion.reason.kind === "canceled") {
+    return { kind: "done", run: await finishRun(store, settled, "canceled", { kind: "canceled" }) };
+  }
+  if (completion.reason.kind !== "exit" || !job.successExitCodes.includes(completion.reason.code)) {
+    return { kind: "done", run: await finishRun(store, settled, "failed", { kind: "recovery_failed" }) };
+  }
+  const originalReason = last.terminalReason;
+  if (originalReason === null) throw new Error("recovered attempt has no original terminal reason");
+  if (job.recovery?.onSuccess === "fail") {
+    return { kind: "done", run: await finishRun(store, settled, "failed", originalReason) };
+  }
+  return scheduleRetryOrFinish(store, job, settled, originalReason);
+}
+
+async function scheduleRetryOrFinish(
+  store: FileProjectStore,
+  job: JobDefinition,
+  run: Run,
+  reason: TerminalReason,
+): Promise<LifecycleDecision> {
+  if (!canRetry(job, reason, run.attempts.length)) {
+    return { kind: "done", run: await finishRun(store, run, "failed", reason) };
+  }
+  const delayMs = retryDelay(job, run.attempts.length);
+  const readyAt = new Date(Date.now() + delayMs).toISOString();
+  const waiting = Object.freeze({
+    ...run,
+    state: "retry_wait" as const,
+    updatedAt: new Date().toISOString(),
+    process: null,
+    retryReadyAt: readyAt,
+  });
+  await store.saveRun(waiting);
+  await removeActiveRun(store, waiting.runId);
+  await store.appendEvent(event(waiting, "run.retry_wait", waiting.updatedAt, { next_attempt: waiting.attempts.length + 1, delay_ms: delayMs, ready_at: readyAt }));
+  return { kind: "retry", delayMs };
+}
+
+interface StartedShell {
+  readonly identity: ShellHandle["identity"] | null;
+  readonly startedAt: string;
+  readonly completion: Promise<ShellCompletion>;
+}
+
+async function startConfiguredShell(
+  job: JobDefinition,
+  command: string,
+  timeoutMs: number | undefined,
+  projectRoot: string,
+  logs: { readonly stdout: string; readonly stderr: string },
+  options: ExecuteJobOptions,
+): Promise<StartedShell> {
+  const startedAt = new Date().toISOString();
+  try {
+    const handle = await startShell({
+      shell: job.shell,
+      command,
+      cwd: resolve(projectRoot, job.cwd),
+      env: buildJobEnvironment(job),
+      stdoutPath: logs.stdout,
+      stderrPath: logs.stderr,
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      ...(options.stdout === undefined ? {} : { stdoutTee: options.stdout }),
+      ...(options.stderr === undefined ? {} : { stderrTee: options.stderr }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
+    return Object.freeze({ identity: handle.identity, startedAt: handle.startedAt, completion: handle.completion });
+  } catch (error) {
+    const finishedAt = new Date().toISOString();
+    const code = errorCode(error) ?? (error instanceof Error ? error.name : undefined);
+    const reason: TerminalReason = { kind: "spawn_error", ...(code === undefined ? {} : { code }) };
+    const completion: ShellCompletion = Object.freeze({
+      reason,
+      finishedAt,
+    });
+    return Object.freeze({ identity: null, startedAt, completion: Promise.resolve(completion) });
+  }
+}
+
+async function finishRun(
+  store: FileProjectStore,
+  run: Run,
+  state: "succeeded" | "failed" | "canceled",
+  reason: TerminalReason,
+): Promise<Run> {
+  const now = new Date().toISOString();
+  const { retryReadyAt: _retryReadyAt, ...runWithoutRetry } = run;
+  const finished = Object.freeze({
+    ...runWithoutRetry,
     state,
-    attempts: Object.freeze([Object.freeze({ ...attempt, finishedAt: completion.finishedAt, terminalReason: reason })]),
-    updatedAt: completion.finishedAt,
+    updatedAt: now,
     process: null,
     terminalReason: reason,
   });
-  await store.saveRun(run);
-  let projectState = await store.loadState() ?? emptyProjectState();
-  const expectedRevision = projectState.revision;
-  projectState = Object.freeze({
-    ...projectState,
-    revision: projectState.revision + 1,
-    activeRunIds: Object.freeze(projectState.activeRunIds.filter((id) => id !== run.runId)),
+  await store.saveRun(finished);
+  await removeActiveRun(store, run.runId);
+  await store.appendEvent(event(finished, `run.${state}`, now, terminalDetails(reason)));
+  return finished;
+}
+
+async function addActiveRun(store: FileProjectStore, state: ProjectState, runId: string): Promise<Run> {
+  if (!state.activeRunIds.includes(runId)) {
+    const next = Object.freeze({
+      ...state,
+      revision: state.revision + 1,
+      activeRunIds: Object.freeze([...state.activeRunIds, runId]),
+    });
+    await store.saveState(next, state.revision);
+  }
+  return requiredRun(store, runId);
+}
+
+async function removeActiveRun(store: FileProjectStore, runId: string): Promise<void> {
+  const state = await store.loadState() ?? emptyProjectState();
+  if (!state.activeRunIds.includes(runId)) return;
+  const next = Object.freeze({
+    ...state,
+    revision: state.revision + 1,
+    activeRunIds: Object.freeze(state.activeRunIds.filter((id) => id !== runId)),
   });
-  await store.saveState(projectState, expectedRevision);
-  await store.appendEvent(event(run, `run.${state}`, completion.finishedAt, terminalDetails(reason)));
-  const paths = store.pathsFor(run.runId);
-  return resultFromRun(run, paths.stdout, paths.stderr);
+  await store.saveState(next, state.revision);
+}
+
+async function requiredRun(store: FileProjectStore, runId: string): Promise<Run> {
+  const run = await store.loadRun(runId);
+  if (run === null) throw new Error(`run ${runId} disappeared`);
+  return run;
+}
+
+function canRetry(job: JobDefinition, reason: TerminalReason, attempts: number): boolean {
+  if (attempts >= job.retry.maxAttempts || reason.kind === "canceled") return false;
+  if (job.retry.onExitCodes === undefined) return true;
+  return reason.kind === "exit" && job.retry.onExitCodes.includes(reason.code);
+}
+
+function retryDelay(job: JobDefinition, failedAttempt: number): number {
+  const multiplier = job.retry.backoff === "exponential" ? 2 ** Math.max(0, failedAttempt - 1) : 1;
+  const calculated = job.retry.delayMs * multiplier;
+  return Math.min(calculated, job.retry.maxDelayMs ?? Number.MAX_SAFE_INTEGER);
+}
+
+async function waitForRetry(delayMs: number, signal: AbortSignal | undefined): Promise<void> {
+  if (delayMs === 0 || signal?.aborted === true) return;
+  await new Promise<void>((resolveDelay) => {
+    const timer = setTimeout(done, delayMs);
+    const abort = (): void => done();
+    function done(): void {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      resolveDelay();
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
 export async function requestJobCancellation(loaded: LoadedDefinition, jobId: string): Promise<string> {
   const store = new FileProjectStore(resolve(dirname(loaded.file), loaded.definition.project.stateDir));
   await store.initialize();
   const lease = await acquireProjectLock(store.lock, createRunId(), 250);
-  let identity;
+  let identity = null;
   let runId: string;
   try {
     const state = await recoverOrphanedRuns(store);
-    const activeRuns = await Promise.all(state.activeRunIds.map((id) => store.loadRun(id)));
-    const run = activeRuns.find((candidate) => candidate?.jobId === jobId) ?? null;
-    if (run === null || run.process === null) throw preflight("KJRUN006", `job ${jobId} is not running`, `jobs.${jobId}`);
-    identity = run.process;
+    const latestRunId = state.latestRunByJob[jobId];
+    const run = latestRunId === undefined ? null : await store.loadRun(latestRunId);
+    if (run === null || isTerminalRunState(run.state)) throw preflight("KJRUN006", `job ${jobId} is not running`, `jobs.${jobId}`);
     runId = run.runId;
     const now = new Date().toISOString();
-    await store.saveRun(Object.freeze({ ...run, cancelRequestedAt: now, updatedAt: now }));
-    await store.appendEvent(event(run, "run.cancel_requested", now));
-    signalProcessGroup(identity.pid, "SIGTERM");
+    const requested = Object.freeze({ ...run, cancelRequestedAt: now, updatedAt: now });
+    await store.saveRun(requested);
+    await store.appendEvent(event(requested, "run.cancel_requested", now));
+    identity = run.process;
+    if (identity === null) await finishRun(store, requested, "canceled", { kind: "canceled" });
+    else signalProcessGroup(identity.pid, "SIGTERM");
   } finally {
     await lease.release();
   }
+  if (identity === null) return runId;
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 1_000));
   if (await processIdentityMatches(identity)) signalProcessGroup(identity.pid, "SIGKILL");
   return runId;
@@ -240,25 +464,34 @@ export async function recoverOrphanedRuns(store: FileProjectStore): Promise<Proj
   let state = loaded ?? emptyProjectState();
   const retained: string[] = [];
   let changed = false;
-  for (const runId of state.activeRunIds) {
+  const activeIds = new Set(state.activeRunIds);
+  const candidateIds = new Set([...state.activeRunIds, ...Object.values(state.latestRunByJob)]);
+  for (const runId of candidateIds) {
     const run = await store.loadRun(runId);
     if (run === null || isTerminalRunState(run.state)) {
-      changed = true;
+      if (activeIds.has(runId)) changed = true;
       continue;
     }
     if (run.process !== null && await processIdentityMatches(run.process)) {
-      retained.push(runId);
+      if (activeIds.has(runId)) retained.push(runId);
       continue;
     }
     if (await processIdentityMatches(run.ownerProcess)) {
-      retained.push(runId);
+      if (activeIds.has(runId)) retained.push(runId);
       continue;
     }
     const now = new Date().toISOString();
     const reason: TerminalReason = { kind: "orphaned" };
-    const attempts = run.attempts.map((attempt, index) => index === run.attempts.length - 1
-      ? Object.freeze({ ...attempt, finishedAt: now, terminalReason: reason })
-      : attempt);
+    const attempts = run.attempts.map((attempt, index) => {
+      if (index !== run.attempts.length - 1) return attempt;
+      if (run.state === "recovering" && attempt.recovery !== undefined) {
+        return Object.freeze({
+          ...attempt,
+          recovery: Object.freeze({ ...attempt.recovery, finishedAt: now, process: null, terminalReason: reason }),
+        });
+      }
+      return Object.freeze({ ...attempt, finishedAt: now, process: null, terminalReason: reason });
+    });
     const interrupted = Object.freeze({
       ...run,
       state: "interrupted" as const,
@@ -289,11 +522,20 @@ async function validateStart(
   job: JobDefinition,
   maxParallel: number,
   resources: ReadonlyMap<string, { readonly capacity: number }>,
+  ignoredRunId?: string,
 ): Promise<void> {
   if (state.activeRunIds.length >= maxParallel) throw preflight("KJRUN003", "project parallel limit is exhausted", `jobs.${job.id}`);
   for (const activeId of state.activeRunIds) {
+    if (activeId === ignoredRunId) continue;
     const active = await store.loadRun(activeId);
     if (active?.jobId === job.id) throw preflight("KJRUN004", `job ${job.id} is already running`, `jobs.${job.id}`);
+  }
+  const latestRunId = state.latestRunByJob[job.id];
+  if (latestRunId !== undefined && latestRunId !== ignoredRunId) {
+    const latest = await store.loadRun(latestRunId);
+    if (latest !== null && !isTerminalRunState(latest.state)) {
+      throw preflight("KJRUN004", `job ${job.id} already has an active run`, `jobs.${job.id}`);
+    }
   }
   for (const dependency of job.needs) {
     const dependencyRunId = state.latestRunByJob[dependency];
@@ -302,6 +544,7 @@ async function validateStart(
   }
   const used = new Map<string, number>();
   for (const runId of state.activeRunIds) {
+    if (runId === ignoredRunId) continue;
     const snapshot = await store.loadDefinitionSnapshot(runId);
     if (!isObject(snapshot) || !isObject(snapshot.resources)) continue;
     for (const [id, amount] of Object.entries(snapshot.resources)) {
@@ -312,20 +555,6 @@ async function validateStart(
     const capacity = resources.get(id)?.capacity ?? 0;
     if ((used.get(id) ?? 0) + amount > capacity) throw preflight("KJRUN007", `resource ${id} has insufficient capacity`, `jobs.${job.id}.resources.${id}`);
   }
-}
-
-async function failCreatedRun(store: FileProjectStore, state: ProjectState, run: Run, reason: TerminalReason): Promise<Run> {
-  const now = new Date().toISOString();
-  const failed = Object.freeze({ ...run, state: "failed" as const, updatedAt: now, terminalReason: reason });
-  await store.saveRun(failed);
-  const next = Object.freeze({
-    ...state,
-    revision: state.revision + 1,
-    activeRunIds: Object.freeze(state.activeRunIds.filter((id) => id !== run.runId)),
-  });
-  await store.saveState(next, state.revision);
-  await store.appendEvent(event(failed, "run.failed", now, terminalDetails(reason)));
-  return failed;
 }
 
 async function stateFileWasAbsent(store: FileProjectStore): Promise<boolean> {
@@ -347,6 +576,18 @@ function definitionSnapshot(job: JobDefinition): Readonly<Record<string, unknown
     inherit_env: [...job.inheritEnv],
     timeout_ms: job.timeoutMs ?? null,
     success_exit_codes: [...job.successExitCodes],
+    retry: {
+      max_attempts: job.retry.maxAttempts,
+      delay_ms: job.retry.delayMs,
+      backoff: job.retry.backoff,
+      max_delay_ms: job.retry.maxDelayMs ?? null,
+      on_exit_codes: job.retry.onExitCodes ?? null,
+    },
+    recovery: job.recovery === undefined ? null : {
+      command: job.recovery.command,
+      timeout_ms: job.recovery.timeoutMs ?? null,
+      on_success: job.recovery.onSuccess,
+    },
   });
 }
 
@@ -362,15 +603,17 @@ function event(run: Run, kind: string, occurredAt: string, details?: Readonly<Re
   });
 }
 
-function resultFromRun(run: Run, stdoutPath: string, stderrPath: string): JobExecutionResult {
+function resultFromRun(run: Run): JobExecutionResult {
   if (run.terminalReason === undefined) throw new Error("terminal run has no reason");
+  const lastAttempt = run.attempts.at(-1);
+  if (lastAttempt?.stdoutPath === undefined || lastAttempt.stderrPath === undefined) throw new Error("terminal run has no attempt logs");
   return Object.freeze({
     runId: run.runId,
     jobId: run.jobId,
     state: run.state,
     terminalReason: run.terminalReason,
-    stdoutPath,
-    stderrPath,
+    stdoutPath: lastAttempt.stdoutPath,
+    stderrPath: lastAttempt.stderrPath,
   });
 }
 

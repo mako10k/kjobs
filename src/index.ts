@@ -20,6 +20,7 @@ export type {
   AggregateJobState,
   AttemptSummary,
   ProcessIdentity,
+  RecoveryAttemptSummary,
   Run,
   RunState,
   TerminalReason,
@@ -61,7 +62,7 @@ export {
   FileProjectStore,
   RevisionConflictError,
 } from "./storage/file-project-store.js";
-export type { ProjectEvent, RunPaths } from "./storage/file-project-store.js";
+export type { ProcessLogPaths, ProjectEvent, RunPaths } from "./storage/file-project-store.js";
 export { inspectProcessIdentity, processIdentityMatches } from "./storage/process-identity.js";
 export { PerttoolPriorityProvider, projectPriorityDocument } from "./priority/perttool-provider.js";
 export {

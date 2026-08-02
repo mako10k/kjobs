@@ -32,7 +32,11 @@ node dist/cli.js run hello --file docs/examples/minimal.kjobs.yaml
 
 The current implementation provides strict `kjobs.yaml` version 1 validation,
 durable explicit-ID shell execution, timeout and cancellation, local locking,
-orphaned-run recovery, and automatic next-job selection. `kjobs next` projects
+orphaned-run recovery, bounded retry and recovery commands, typed one-level job
+templates, and automatic next-job selection. Main and recovery process results
+and logs are retained separately for every attempt. `retry_wait` releases its
+parallel and declared-resource capacity and can be canceled normally.
+`kjobs next` projects
 the current definition and persisted run states into an in-memory perttool
 Grammar 5 document and reports Ready, Recommended, Startable, and Blocked jobs.
 Running without a job ID executes only perttool's complete

@@ -154,6 +154,156 @@ resources:
   await running;
 });
 
+test("retry policy persists separate attempts and can succeed", async () => {
+  const { directory, loaded } = await project(`
+schema_version: 1
+project: { id: retry-success }
+jobs:
+  flaky:
+    command: "if [ -f marker ]; then printf success; else touch marker; exit 7; fi"
+    estimate: 1p
+    retry: { max_attempts: 2, delay: 10ms, on_exit_codes: [7] }
+`);
+  const result = await executeExplicitJob({ loaded, jobId: "flaky" });
+  assert.equal(result.state, "succeeded");
+  const store = new FileProjectStore(join(directory, ".kjobs"));
+  const run = await store.loadRun(result.runId);
+  assert.equal(run.attempts.length, 2);
+  assert.deepEqual(run.attempts[0].terminalReason, { kind: "exit", code: 7 });
+  assert.deepEqual(run.attempts[1].terminalReason, { kind: "exit", code: 0 });
+  assert.notEqual(run.attempts[0].stdoutPath, run.attempts[1].stdoutPath);
+  assert.equal(await readFile(run.attempts[1].stdoutPath, "utf8"), "success");
+});
+
+test("retry exit-code filter can stop after the first failure", async () => {
+  const { directory, loaded } = await project(`
+schema_version: 1
+project: { id: retry-filter }
+jobs:
+  fail:
+    command: exit 8
+    estimate: 1p
+    retry: { max_attempts: 3, delay: 1ms, on_exit_codes: [7] }
+`);
+  const result = await executeExplicitJob({ loaded, jobId: "fail" });
+  assert.deepEqual(result.terminalReason, { kind: "exit", code: 8 });
+  const run = await new FileProjectStore(join(directory, ".kjobs")).loadRun(result.runId);
+  assert.equal(run.attempts.length, 1);
+});
+
+test("exponential retry delay is capped by max_delay", async () => {
+  const { directory, loaded } = await project(`
+schema_version: 1
+project: { id: retry-backoff }
+jobs:
+  fail:
+    command: exit 5
+    estimate: 1p
+    retry: { max_attempts: 3, delay: 2ms, backoff: exponential, max_delay: 3ms }
+`);
+  const result = await executeExplicitJob({ loaded, jobId: "fail" });
+  assert.equal(result.state, "failed");
+  const store = new FileProjectStore(join(directory, ".kjobs"));
+  assert.equal((await store.loadRun(result.runId)).attempts.length, 3);
+  const events = (await readFile(store.eventsPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(events.filter((event) => event.kind === "run.retry_wait").map((event) => event.details.delay_ms), [2, 3]);
+});
+
+test("successful recovery is recorded separately before retry", async () => {
+  const { directory, loaded } = await project(`
+schema_version: 1
+project: { id: recovery-success }
+jobs:
+  repairable:
+    command: "if [ -f repaired ]; then printf main-ok; else exit 9; fi"
+    estimate: 1p
+    retry: { max_attempts: 2, delay: 1ms, on_exit_codes: [9] }
+    recovery: { command: "touch repaired; printf repaired", on_success: retry }
+`);
+  const result = await executeExplicitJob({ loaded, jobId: "repairable" });
+  assert.equal(result.state, "succeeded");
+  const run = await new FileProjectStore(join(directory, ".kjobs")).loadRun(result.runId);
+  assert.equal(run.attempts.length, 2);
+  assert.deepEqual(run.attempts[0].recovery.terminalReason, { kind: "exit", code: 0 });
+  assert.equal(await readFile(run.attempts[0].recovery.stdoutPath, "utf8"), "repaired");
+  assert.equal(await readFile(run.attempts[1].stdoutPath, "utf8"), "main-ok");
+});
+
+test("failed recovery preserves both failures and stops", async () => {
+  const { directory, loaded } = await project(`
+schema_version: 1
+project: { id: recovery-failure }
+jobs:
+  broken:
+    command: exit 9
+    estimate: 1p
+    retry: { max_attempts: 3, delay: 1ms }
+    recovery: { command: "printf recovery-error >&2; exit 4", on_success: retry }
+`);
+  const result = await executeExplicitJob({ loaded, jobId: "broken" });
+  assert.deepEqual(result.terminalReason, { kind: "recovery_failed" });
+  const run = await new FileProjectStore(join(directory, ".kjobs")).loadRun(result.runId);
+  assert.equal(run.attempts.length, 1);
+  assert.deepEqual(run.attempts[0].terminalReason, { kind: "exit", code: 9 });
+  assert.deepEqual(run.attempts[0].recovery.terminalReason, { kind: "exit", code: 4 });
+  assert.equal(await readFile(run.attempts[0].recovery.stderrPath, "utf8"), "recovery-error");
+});
+
+test("recovery on_success fail never converts the original failure", async () => {
+  const { directory, loaded } = await project(`
+schema_version: 1
+project: { id: recovery-stop }
+jobs:
+  repaired:
+    command: exit 6
+    estimate: 1p
+    retry: { max_attempts: 3, delay: 1ms }
+    recovery: { command: "printf repaired", on_success: fail }
+`);
+  const result = await executeExplicitJob({ loaded, jobId: "repaired" });
+  assert.deepEqual(result.terminalReason, { kind: "exit", code: 6 });
+  const run = await new FileProjectStore(join(directory, ".kjobs")).loadRun(result.runId);
+  assert.equal(run.attempts.length, 1);
+  assert.deepEqual(run.attempts[0].recovery.terminalReason, { kind: "exit", code: 0 });
+});
+
+test("retry wait releases capacity and can be canceled", async () => {
+  const { directory, loaded } = await project(`
+schema_version: 1
+project: { id: retry-capacity, max_parallel: 1 }
+jobs:
+  waiting:
+    command: exit 7
+    estimate: 1p
+    retry: { max_attempts: 2, delay: 500ms }
+  other: { command: "printf other", estimate: 1p }
+`);
+  const waiting = executeExplicitJob({ loaded, jobId: "waiting" });
+  const waitingRun = await waitForRetryReleased(loaded);
+  const store = new FileProjectStore(join(directory, ".kjobs"));
+  assert.deepEqual((await store.loadState()).activeRunIds, []);
+  assert.equal((await executeExplicitJob({ loaded, jobId: "other" })).state, "succeeded");
+  assert.equal(await requestJobCancellation(loaded, "waiting"), waitingRun.runId);
+  assert.equal((await waiting).state, "canceled");
+});
+
+test("template jobs execute their effective command", async () => {
+  const { loaded } = await project(`
+schema_version: 1
+project: { id: template-execution }
+templates:
+  print:
+    inputs:
+      value: { type: string, required: true }
+    command: "printf '\${{ inputs.value }}'"
+jobs:
+  rendered: { template: print, with: { value: expanded }, estimate: 1p }
+`);
+  const result = await executeExplicitJob({ loaded, jobId: "rendered" });
+  assert.equal(result.state, "succeeded");
+  assert.equal(await readFile(result.stdoutPath, "utf8"), "expanded");
+});
+
 async function waitForActiveRun(loaded) {
   const store = new FileProjectStore(join(dirname(loaded.file), loaded.definition.project.stateDir));
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -165,4 +315,25 @@ async function waitForActiveRun(loaded) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   throw new Error("run did not become active");
+}
+
+async function waitForRunState(loaded, expectedState) {
+  const store = new FileProjectStore(join(dirname(loaded.file), loaded.definition.project.stateDir));
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    for (const run of await store.listRuns()) if (run.state === expectedState) return run;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`run did not enter ${expectedState}`);
+}
+
+async function waitForRetryReleased(loaded) {
+  const store = new FileProjectStore(join(dirname(loaded.file), loaded.definition.project.stateDir));
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const state = await store.loadState();
+    for (const run of await store.listRuns()) {
+      if (run.state === "retry_wait" && state?.activeRunIds.includes(run.runId) === false) return run;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("retry wait did not release capacity");
 }

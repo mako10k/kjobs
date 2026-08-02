@@ -223,7 +223,7 @@ function parseTemplateInput(
   });
 }
 
-const TEMPLATE_KEYS = ["inputs", "command", "cwd", "shell", "env", "inherit_env", "timeout", "success_exit_codes", "retry", "recovery"] as const;
+const TEMPLATE_KEYS = ["inputs", "command", "cwd", "shell", "env", "inherit_env", "timeout", "success_exit_codes", "resources", "retry", "recovery"] as const;
 
 function parseTemplates(validator: DefinitionValidator, value: unknown): ReadonlyMap<string, JobTemplate> {
   if (value === undefined) return new Map();
@@ -259,6 +259,7 @@ function parseTemplates(validator: DefinitionValidator, value: unknown): Readonl
       inheritEnv: validator.stringArray(template.inherit_env, `templates.${id}.inherit_env`),
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
       successExitCodes: parseExitCodes(validator, template.success_exit_codes, `templates.${id}.success_exit_codes`),
+      resources: parseResourceRequirements(validator, template.resources, `templates.${id}.resources`),
       retry: parseRetry(validator, template.retry, `templates.${id}.retry`),
       ...(recovery === undefined ? {} : { recovery }),
     }));
@@ -320,6 +321,7 @@ function parseJobs(
   validator: DefinitionValidator,
   value: unknown,
   project: ProjectDefinition,
+  templates: ReadonlyMap<string, JobTemplate>,
 ): ReadonlyMap<string, JobDefinition> {
   const object = validator.object(value, "jobs");
   const result = new Map<string, JobDefinition>();
@@ -330,36 +332,70 @@ function parseJobs(
     const job = validator.object(raw, `jobs.${id}`);
     if (job === null) continue;
     validator.keys(job, JOB_KEYS, `jobs.${id}`);
-    const command = job.command === undefined ? undefined : validator.string(job.command, `jobs.${id}.command`);
+    const declaredCommand = job.command === undefined ? undefined : validator.string(job.command, `jobs.${id}.command`);
     const template = job.template === undefined ? undefined : validator.string(job.template, `jobs.${id}.template`);
-    if (command === undefined && template === undefined) validator.error("KJCFG020", "job requires command or template", `jobs.${id}`);
+    if (declaredCommand === undefined && template === undefined) validator.error("KJCFG020", "job requires command or template", `jobs.${id}`);
+    const templateDefinition = template === undefined ? undefined : templates.get(template);
+    const suppliedInputs = parseTemplateValues(validator, job.with, `jobs.${id}.with`);
+    if (template === undefined && suppliedInputs.size > 0) {
+      validator.error("KJCFG034", "template inputs require a template", `jobs.${id}.with`);
+    }
+    const effectiveInputs = resolveTemplateInputs(validator, id, templateDefinition, suppliedInputs);
+    const expand = (value: string | undefined, path: string): string | undefined => value === undefined
+      ? undefined
+      : interpolateTemplate(validator, value, effectiveInputs, path);
+    const templateCommand = expand(templateDefinition?.command, `templates.${template ?? "unknown"}.command`);
+    const command = declaredCommand ?? templateCommand ?? "";
     const description = job.description === undefined ? undefined : validator.string(job.description, `jobs.${id}.description`);
-    const cwd = job.cwd === undefined ? "." : (validator.string(job.cwd, `jobs.${id}.cwd`) ?? ".");
-    const shell = job.shell === undefined ? project.shell : (validator.string(job.shell, `jobs.${id}.shell`) ?? project.shell);
+    const templateCwd = expand(templateDefinition?.cwd, `templates.${template ?? "unknown"}.cwd`);
+    const templateShell = expand(templateDefinition?.shell, `templates.${template ?? "unknown"}.shell`);
+    const cwd = job.cwd === undefined ? (templateCwd ?? ".") : (validator.string(job.cwd, `jobs.${id}.cwd`) ?? ".");
+    const shell = job.shell === undefined ? (templateShell ?? project.shell) : (validator.string(job.shell, `jobs.${id}.shell`) ?? project.shell);
     const priority = validator.integer(job.priority, `jobs.${id}.priority`, 0) ?? 0;
     const estimate = validator.string(job.estimate, `jobs.${id}.estimate`);
     if (estimate !== undefined && !ESTIMATE_PATTERN.test(estimate)) {
       validator.error("KJCFG021", "estimate must be a positive Point duration", `jobs.${id}.estimate`, "Examples: 3p, 1.5p, 1/2p.");
     }
-    const timeoutMs = job.timeout === undefined ? undefined : validator.duration(job.timeout, `jobs.${id}.timeout`);
-    const recovery = parseRecovery(validator, job.recovery, `jobs.${id}.recovery`);
+    const timeoutMs = job.timeout === undefined
+      ? templateDefinition?.timeoutMs
+      : validator.duration(job.timeout, `jobs.${id}.timeout`);
+    const declaredRecovery = parseRecovery(validator, job.recovery, `jobs.${id}.recovery`);
+    const templateRecovery = templateDefinition?.recovery === undefined ? undefined : Object.freeze({
+      ...templateDefinition.recovery,
+      command: interpolateTemplate(validator, templateDefinition.recovery.command, effectiveInputs, `templates.${template}.recovery.command`),
+    });
+    const recovery = job.recovery === undefined ? templateRecovery : declaredRecovery;
+    const templateEnvironment = new Map<string, string>();
+    for (const [name, value] of templateDefinition?.env ?? []) {
+      templateEnvironment.set(name, interpolateTemplate(validator, value, effectiveInputs, `templates.${template}.env.${name}`));
+    }
+    const declaredEnvironment = parseStringMap(validator, job.env, `jobs.${id}.env`);
+    const environment = new Map([...templateEnvironment, ...declaredEnvironment]);
     result.set(id, Object.freeze({
       id,
-      ...(command === undefined ? {} : { command }),
+      command,
       ...(template === undefined ? {} : { template }),
-      templateInputs: parseTemplateValues(validator, job.with, `jobs.${id}.with`),
+      templateInputs: effectiveInputs,
       ...(description === undefined ? {} : { description }),
       cwd,
       shell,
       needs: validator.stringArray(job.needs, `jobs.${id}.needs`),
       priority,
       estimate: estimate ?? "1p",
-      resources: parseResourceRequirements(validator, job.resources, `jobs.${id}.resources`),
-      env: parseStringMap(validator, job.env, `jobs.${id}.env`),
-      inheritEnv: validator.stringArray(job.inherit_env, `jobs.${id}.inherit_env`),
+      resources: job.resources === undefined
+        ? (templateDefinition?.resources ?? new Map())
+        : parseResourceRequirements(validator, job.resources, `jobs.${id}.resources`),
+      env: environment,
+      inheritEnv: job.inherit_env === undefined
+        ? (templateDefinition?.inheritEnv ?? Object.freeze([]))
+        : validator.stringArray(job.inherit_env, `jobs.${id}.inherit_env`),
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
-      successExitCodes: parseExitCodes(validator, job.success_exit_codes, `jobs.${id}.success_exit_codes`),
-      retry: parseRetry(validator, job.retry, `jobs.${id}.retry`),
+      successExitCodes: job.success_exit_codes === undefined
+        ? (templateDefinition?.successExitCodes ?? Object.freeze([0]))
+        : parseExitCodes(validator, job.success_exit_codes, `jobs.${id}.success_exit_codes`),
+      retry: job.retry === undefined
+        ? (templateDefinition?.retry ?? Object.freeze({ maxAttempts: 1, delayMs: 0, backoff: "fixed" as const }))
+        : parseRetry(validator, job.retry, `jobs.${id}.retry`),
       ...(recovery === undefined ? {} : { recovery }),
     }));
   }
@@ -372,6 +408,13 @@ function validateReferences(
   templates: ReadonlyMap<string, JobTemplate>,
   resources: ReadonlyMap<string, ResourceDefinition>,
 ): void {
+  for (const [templateId, template] of templates) {
+    for (const [resourceId, amount] of template.resources) {
+      const resource = resources.get(resourceId);
+      if (resource === undefined) validator.error("KJCFG024", `unknown resource ${resourceId}`, `templates.${templateId}.resources.${resourceId}`);
+      else if (amount > resource.capacity) validator.error("KJCFG025", `requirement exceeds capacity ${resource.capacity}`, `templates.${templateId}.resources.${resourceId}`);
+    }
+  }
   for (const job of jobs.values()) {
     for (const dependency of job.needs) {
       if (!jobs.has(dependency)) validator.error("KJCFG022", `unknown dependency ${dependency}`, `jobs.${job.id}.needs`);
@@ -383,21 +426,8 @@ function validateReferences(
       else if (amount > resource.capacity) validator.error("KJCFG025", `requirement exceeds capacity ${resource.capacity}`, `jobs.${job.id}.resources.${resourceId}`);
     }
     if (job.template !== undefined) {
-      const template = templates.get(job.template);
-      if (template === undefined) {
+      if (!templates.has(job.template)) {
         validator.error("KJCFG026", `unknown template ${job.template}`, `jobs.${job.id}.template`);
-      } else {
-        for (const key of job.templateInputs.keys()) {
-          if (!template.inputs.has(key)) validator.error("KJCFG027", `unknown template input ${key}`, `jobs.${job.id}.with.${key}`);
-        }
-        for (const [key, input] of template.inputs) {
-          const value = job.templateInputs.get(key);
-          if (value === undefined && input.required && input.defaultValue === undefined) {
-            validator.error("KJCFG028", `missing required template input ${key}`, `jobs.${job.id}.with`);
-          } else if (value !== undefined && !matchesInputType(value, input.type)) {
-            validator.error("KJCFG029", `template input ${key} must have type ${input.type}`, `jobs.${job.id}.with.${key}`);
-          }
-        }
       }
     }
   }
@@ -423,6 +453,49 @@ function validateReferences(
 function matchesInputType(value: unknown, type: TemplateInputType): boolean {
   if (type === "integer") return typeof value === "number" && Number.isInteger(value);
   return typeof value === type;
+}
+
+function resolveTemplateInputs(
+  validator: DefinitionValidator,
+  jobId: string,
+  template: JobTemplate | undefined,
+  supplied: ReadonlyMap<string, string | number | boolean>,
+): ReadonlyMap<string, string | number | boolean> {
+  if (template === undefined) return supplied;
+  const result = new Map<string, string | number | boolean>();
+  for (const key of supplied.keys()) {
+    if (!template.inputs.has(key)) validator.error("KJCFG027", `unknown template input ${key}`, `jobs.${jobId}.with.${key}`);
+  }
+  for (const [key, input] of template.inputs) {
+    const suppliedValue = supplied.get(key);
+    const value = suppliedValue ?? input.defaultValue;
+    if (value === undefined && input.required) {
+      validator.error("KJCFG028", `missing required template input ${key}`, `jobs.${jobId}.with`);
+    } else if (value !== undefined && !matchesInputType(value, input.type)) {
+      validator.error("KJCFG029", `template input ${key} must have type ${input.type}`, `jobs.${jobId}.with.${key}`);
+    } else if (value !== undefined) {
+      result.set(key, value);
+    }
+  }
+  return result;
+}
+
+function interpolateTemplate(
+  validator: DefinitionValidator,
+  source: string,
+  inputs: ReadonlyMap<string, string | number | boolean>,
+  path: string,
+): string {
+  const expanded = source.replace(/\$\{\{\s*inputs\.([A-Za-z][A-Za-z0-9_-]{0,63})\s*\}\}/gu, (_match, name: string) => {
+    const value = inputs.get(name);
+    if (value === undefined) {
+      validator.error("KJCFG032", `undefined template input ${name}`, path);
+      return "";
+    }
+    return String(value);
+  });
+  if (expanded.includes("${{")) validator.error("KJCFG033", "invalid template expression", path, "Only ${{ inputs.NAME }} is supported.");
+  return expanded;
 }
 
 export function parseDefinition(text: string): ApplicationResult<KjobsDefinition> {
@@ -455,7 +528,7 @@ export function parseDefinition(text: string): ApplicationResult<KjobsDefinition
 
   const templates = parseTemplates(validator, root.templates);
   const resources = parseResources(validator, root.resources);
-  const jobs = project === null ? new Map<string, JobDefinition>() : parseJobs(validator, root.jobs, project);
+  const jobs = project === null ? new Map<string, JobDefinition>() : parseJobs(validator, root.jobs, project, templates);
   validateReferences(validator, jobs, templates, resources);
   if (validator.diagnostics.length > 0 || project === null) return failure(validator.diagnostics);
   return success(Object.freeze({ schemaVersion: 1 as const, project, templates, jobs, resources }));

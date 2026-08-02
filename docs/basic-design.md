@@ -363,12 +363,16 @@ interface PriorityResult {
     <run-id>/
       run.json
       definition.json
-      stdout.log
-      stderr.log
       attempts/
-        <attempt-number>.json
-        <attempt-number>-recovery.json
+        <attempt-number>/
+          stdout.log
+          stderr.log
+          recovery-stdout.log
+          recovery-stderr.log
 ```
+
+AttemptとRecoveryAttemptの時刻、終了理由、プロセス識別情報、ログパスは
+`run.json` に保存する。復旧がないAttemptでは `recovery-*` ログを作成しない。
 
 ### 9.1 原子的更新
 

@@ -31,13 +31,14 @@ export interface JobTemplate {
   readonly inheritEnv: readonly string[];
   readonly timeoutMs?: number;
   readonly successExitCodes: readonly number[];
+  readonly resources: ReadonlyMap<string, number>;
   readonly retry: RetryPolicy;
   readonly recovery?: RecoveryPolicy;
 }
 
 export interface JobDefinition {
   readonly id: string;
-  readonly command?: string;
+  readonly command: string;
   readonly template?: string;
   readonly templateInputs: ReadonlyMap<string, string | number | boolean>;
   readonly description?: string;

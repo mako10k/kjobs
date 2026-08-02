@@ -113,3 +113,33 @@ test("orphan recovery waits for a live execution owner to finalize", async () =>
   assert.deepEqual(state.activeRunIds, [run.runId]);
   assert.equal((await store.loadRun(run.runId)).state, "running");
 });
+
+test("orphan recovery finds retry waits outside the active set", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kjobs-retry-orphan-"));
+  const store = new FileProjectStore(directory);
+  await store.initialize();
+  const now = new Date().toISOString();
+  const run = {
+    schemaVersion: 1,
+    runId: createRunId(),
+    jobId: "waiting",
+    definitionDigest: `sha256:${"0".repeat(64)}`,
+    state: "retry_wait",
+    attempts: [],
+    createdAt: now,
+    updatedAt: now,
+    ownerProcess: { pid: 2147483647, startMarker: "missing-owner" },
+    process: null,
+    retryReadyAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+  await store.createRun(run, { resources: {} });
+  await store.saveState({
+    schemaVersion: 1,
+    revision: 0,
+    activeRunIds: [],
+    latestRunByJob: { waiting: run.runId },
+  }, null);
+  const state = await recoverOrphanedRuns(store);
+  assert.deepEqual(state.activeRunIds, []);
+  assert.equal((await store.loadRun(run.runId)).state, "interrupted");
+});

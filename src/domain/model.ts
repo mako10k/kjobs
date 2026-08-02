@@ -35,6 +35,18 @@ export interface AttemptSummary {
   readonly finishedAt: string | null;
   readonly process: ProcessIdentity | null;
   readonly terminalReason: TerminalReason | null;
+  readonly stdoutPath?: string;
+  readonly stderrPath?: string;
+  readonly recovery?: RecoveryAttemptSummary;
+}
+
+export interface RecoveryAttemptSummary {
+  readonly startedAt: string;
+  readonly finishedAt: string | null;
+  readonly process: ProcessIdentity | null;
+  readonly terminalReason: TerminalReason | null;
+  readonly stdoutPath: string;
+  readonly stderrPath: string;
 }
 
 export interface ProcessIdentity {
@@ -54,5 +66,6 @@ export interface Run {
   readonly ownerProcess: ProcessIdentity;
   readonly process: ProcessIdentity | null;
   readonly cancelRequestedAt?: string;
+  readonly retryReadyAt?: string;
   readonly terminalReason?: TerminalReason;
 }
