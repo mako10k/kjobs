@@ -1,0 +1,115 @@
+# Existing .pert plans should normally be maintained through perttool commands; direct DSL editing bypasses goal/DAG owner-confirmation checks.
+project KJOBS:
+  version 5
+  title "General-purpose job management CLI"
+  description "Deliver a simple local CLI for dependency-aware shell jobs, durable execution state, recovery, reusable templates, and perttool-backed priority selection. The initial velocity is provisional until completed work is observed."
+  as_of 2026-08-02
+  duration_unit point
+  velocity 1p/1d
+  finish MVP_ACCEPTED
+
+milestone PROJECT_START:
+  title "Project started"
+  state reached
+
+milestone REQUIREMENTS_READY:
+  title "Requirements accepted"
+
+milestone DESIGN_READY:
+  title "Basic design accepted"
+
+milestone FOUNDATION_READY:
+  title "Project foundation ready"
+
+milestone EXECUTION_READY:
+  title "Execution engine ready"
+
+milestone PRIORITY_READY:
+  title "Priority integration ready"
+
+milestone RESILIENCE_READY:
+  title "Recovery and templates ready"
+
+milestone CLI_READY:
+  title "CLI and observability ready"
+
+milestone MVP_ACCEPTED:
+  title "MVP accepted"
+
+resource DEVELOPMENT:
+  title "Development capacity"
+  capacity 1
+
+task REQUIREMENTS_DEFINITION PROJECT_START -> REQUIREMENTS_READY:
+  title "Define and accept MVP requirements"
+  description "Make product scope, behavior, boundaries, and testable acceptance criteria explicit in docs/requirements.md."
+  duration 3p
+  status done
+  priority 100
+  requires:
+    DEVELOPMENT 1
+  source "docs/requirements.md"
+
+task BASIC_DESIGN REQUIREMENTS_READY -> DESIGN_READY:
+  title "Define architecture and contracts"
+  duration 4p
+  priority 90
+  requires:
+    DEVELOPMENT 1
+
+task PROJECT_FOUNDATION DESIGN_READY -> FOUNDATION_READY:
+  title "Create TypeScript project foundation"
+  duration 5p
+  priority 80
+  requires:
+    DEVELOPMENT 1
+
+task EXECUTION_ENGINE FOUNDATION_READY -> EXECUTION_READY:
+  title "Implement durable shell execution engine"
+  duration 8p
+  priority 70
+  requires:
+    DEVELOPMENT 1
+
+task PERTTOOL_INTEGRATION EXECUTION_READY -> PRIORITY_READY:
+  title "Integrate perttool priority provider"
+  duration 5p
+  priority 60
+  requires:
+    DEVELOPMENT 1
+
+task RECOVERY_TEMPLATES PRIORITY_READY -> RESILIENCE_READY:
+  title "Implement retry recovery and templates"
+  duration 8p
+  priority 50
+  requires:
+    DEVELOPMENT 1
+
+task CLI_OBSERVABILITY RESILIENCE_READY -> CLI_READY:
+  title "Complete CLI status history and JSON output"
+  duration 8p
+  priority 40
+  requires:
+    DEVELOPMENT 1
+
+task MVP_ACCEPTANCE CLI_READY -> MVP_ACCEPTED:
+  title "Run MVP acceptance and document results"
+  duration 5p
+  priority 30
+  requires:
+    DEVELOPMENT 1
+
+work_event WE-13ad038cb717d220618462a578dd5644aa96a837927c3905995e018452e7b87b:
+  model 1
+  task REQUIREMENTS_DEFINITION
+  kind start
+  occurred_at 2026-08-02T09:38:25+09:00
+  planned_value 3p
+
+work_event WE-98c7a6a5aadcdfbe5ab762d3990495404b21f0140142605957c216316f737f04:
+  model 1
+  task REQUIREMENTS_DEFINITION
+  kind finish
+  occurred_at 2026-08-02T09:40:25+09:00
+  active_time 1/30h
+  effort 1/30ph
