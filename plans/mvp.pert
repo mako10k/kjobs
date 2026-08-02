@@ -5,17 +5,15 @@ project KJOBS:
   description "Deliver a simple local CLI for dependency-aware shell jobs, durable execution state, recovery, reusable templates, and perttool-backed priority selection. The initial velocity is provisional until completed work is observed."
   as_of 2026-08-02
   duration_unit point
-  velocity 7p/1d
+  velocity 12p/1d
   finish MVP_ACCEPTED
 
 
 
-milestone DESIGN_READY:
-  title "Basic design accepted"
-  state reached
 
 milestone FOUNDATION_READY:
   title "Project foundation ready"
+  state reached
 
 milestone EXECUTION_READY:
   title "Execution engine ready"
@@ -38,14 +36,6 @@ resource DEVELOPMENT:
 
 
 
-task PROJECT_FOUNDATION DESIGN_READY -> FOUNDATION_READY:
-  title "Create TypeScript project foundation"
-  duration 5p
-  status done
-  priority 80
-  requires:
-    DEVELOPMENT 1
-  source "package.json"
 
 task EXECUTION_ENGINE FOUNDATION_READY -> EXECUTION_READY:
   title "Implement durable shell execution engine"
@@ -82,17 +72,3 @@ task MVP_ACCEPTANCE CLI_READY -> MVP_ACCEPTED:
   requires:
     DEVELOPMENT 1
 
-work_event WE-b635b86582244c0d13fc525377f35a26381371ccf9d49a7960d4350df9fdeafc:
-  model 1
-  task PROJECT_FOUNDATION
-  kind start
-  occurred_at 2026-08-02T09:56:27+09:00
-  planned_value 5p
-
-work_event WE-1e8eec8d991423c9a040587ccdc8fa5022ac6d3d74c6ab17028dbdb3f4097ffd:
-  model 1
-  task PROJECT_FOUNDATION
-  kind finish
-  occurred_at 2026-08-02T10:02:27+09:00
-  active_time 0.1h
-  effort 0.1ph
