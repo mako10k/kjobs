@@ -16,3 +16,17 @@ Validate and inspect the current plan with `perttool 0.5.0`:
 perttool document check plans/mvp.pert --warnings-as-errors
 perttool dag next plans/mvp.pert
 ```
+
+## Development
+
+Node.js 22 or later is required.
+
+```sh
+npm install
+npm run check
+node dist/cli.js validate --file docs/examples/minimal.kjobs.yaml
+```
+
+The current foundation provides strict `kjobs.yaml` version 1 validation and
+the shared domain and adapter contracts. Shell execution is tracked as the
+next implementation slice and is not available yet.

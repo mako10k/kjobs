@@ -1,0 +1,11 @@
+schema_version: 1
+
+project:
+  id: minimal
+  max_parallel: 1
+  shell: /bin/sh
+
+jobs:
+  hello:
+    command: echo hello
+    estimate: 1p
